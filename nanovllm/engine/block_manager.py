@@ -41,9 +41,17 @@ class BlockManager:
         return h.intdigest()
 
     def _allocate_block(self) -> int:
+        '''
+        You only come here when you need allocation for sure and you have asserted there is enough in free blocks 
+        Take a blockid from free, iniitalize it , add to used blocks. return block_id 
+        '''
         block_id = self.free_block_ids.popleft()
         block = self.blocks[block_id]
         assert block.ref_count == 0
+        '''
+        self.hash_to_block_id.get(block.hash) == block_id: cant really happen. defensive. 
+        _deallocate_block doesn't clear hash (yet to learn reason) so this is needed
+        '''
         if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
             del self.hash_to_block_id[block.hash]
         block.reset()
@@ -56,9 +64,14 @@ class BlockManager:
         self.free_block_ids.append(block_id)
 
     def can_allocate(self, seq: Sequence) -> int:
+        '''
+        Doesn't update state. Just find out for num_tokens involved, how many cached blocks 
+        can be used if you want to allocate this. Also make sure there are enough blockids to allocate
+        '''
         h = -1
         num_cached_blocks = 0
-        num_new_blocks = seq.num_blocks
+        num_new_blocks = seq.num_blocks # derived from num_tokens in seq
+
         for i in range(seq.num_blocks - 1):
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
@@ -73,6 +86,15 @@ class BlockManager:
         return num_cached_blocks
 
     def allocate(self, seq: Sequence, num_cached_blocks: int):
+        '''
+        for this sequence, we know that we have num_cached_blocks amount of cached blocks
+        either used or in free. 
+        If used, update ref count 
+        if free, lets remove from free and add to used 
+        update block table 
+        for num_blocks - cached ones, allocate (Take a blockid from free, iniitalize it , add to used blocks) and append to block_table
+        update num_cached_tokens
+        '''
         assert not seq.block_table
         h = -1
         for i in range(num_cached_blocks):
@@ -96,6 +118,7 @@ class BlockManager:
             block = self.blocks[block_id]
             block.ref_count -= 1
             if block.ref_count == 0:
+                # move from used to free block id
                 self._deallocate_block(block_id)
         seq.num_cached_tokens = 0
         seq.block_table.clear()
@@ -108,10 +131,19 @@ class BlockManager:
             seq.block_table.append(self._allocate_block())
 
     def hash_blocks(self, seq: Sequence):
+
         start = seq.num_cached_tokens // self.block_size
         end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size
         if start == end: return
+        '''
+        self.blocks — global physical KV cache pool
+        seq.block_table ->  per-sequence logical → physical map
+        if start == 0, h is -1 
+        else h is the chained hash of previous block 
+        '''
         h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
+
+        # doing till end-1 as end is the count of fully completed blocks 
         for i in range(start, end):
             block = self.blocks[seq.block_table[i]]
             token_ids = seq.block(i)

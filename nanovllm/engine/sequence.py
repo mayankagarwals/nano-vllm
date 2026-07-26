@@ -56,6 +56,9 @@ class Sequence:
     def num_blocks(self):
         return (self.num_tokens + self.block_size - 1) // self.block_size
 
+    '''
+    how many tokens are in the last KV cache block for this sequence?
+    '''
     @property
     def last_block_num_tokens(self):
         return self.num_tokens - (self.num_blocks - 1) * self.block_size

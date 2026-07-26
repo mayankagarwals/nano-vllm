@@ -6,9 +6,22 @@ from transformers import AutoConfig
 @dataclass(slots=True)
 class Config:
     model: str
-    max_num_batched_tokens: int = 16384
-    max_num_seqs: int = 512
+
+    max_num_batched_tokens: int = 16384 # max tokens in one batch 
+
+    max_num_seqs: int = 512 # maximum requests or sequences we support
+    
     max_model_len: int = 4096
+    '''
+    Why not 100% 
+
+    CUDA / driver overhead — context, cuBLAS workspaces, NCCL if multi-GPU
+Activation memory beyond warmup peak — larger batches, longer sequences, or prefill spikes can exceed the warmup peak
+CUDA graph capture — happens after KV allocation; reserves extra memory
+PyTorch allocator fragmentation — you can't pack every byte perfectly
+Shared GPU — desktop/laptop often has display compositor, browser, etc. using VRAM
+
+    '''
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     enforce_eager: bool = False

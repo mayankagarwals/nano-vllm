@@ -23,26 +23,39 @@ class Scheduler:
         self.waiting.append(seq)
 
     def schedule(self) -> tuple[list[Sequence], bool]:
+        '''
+        we want to do prefill in front of decode . Debatable and often a more nuanced implementation in production 
+        '''
+
+
         scheduled_seqs = []
         num_batched_tokens = 0
 
-        # prefill
+        # prefill - gather all prefill 
         while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
-            seq = self.waiting[0]
-            remaining = self.max_num_batched_tokens - num_batched_tokens
+            seq = self.waiting[0] # take first waiting request
+            remaining = self.max_num_batched_tokens - num_batched_tokens # is there room to be prefilled.
             if remaining == 0:
                 break
+            # get num_tokens based on sequence at hand. Remember we are evaluating from prefilll lens right now 
             if not seq.block_table:
                 num_cached_blocks = self.block_manager.can_allocate(seq)
+                # head of line blocking. If first request can't be allocated, break. this is fifo fairness. First request should be served at all cost.
                 if num_cached_blocks == -1:
                     break
                 num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
             else:
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
+            # already found something to prefill? let's not worry about something that isn't fitting
             if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
                 break
+            # just allocate blocks if new request.
             if not seq.block_table:
-                self.block_manager.allocate(seq, num_cached_blocks)
+                self.block_manager.allocate(seq, num_cached_blocks)  
+            # we have all information on scheduling now. Partial or full prefill scheduled. If it's partial this 
+            # will be the only partial one. at next partial we will break. Else will add as many full we can 
+            # partial can only be first request. because if it is partial by definition there is not
+            # budget left for a full or partial prefill
             seq.num_scheduled_tokens = min(num_tokens, remaining)
             num_batched_tokens += seq.num_scheduled_tokens
             if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
@@ -80,6 +93,7 @@ class Scheduler:
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
         for seq, token_id in zip(seqs, token_ids):
+            # update hash for all blocks between [num_cached_tokens and num_scheduled_tokens)
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
