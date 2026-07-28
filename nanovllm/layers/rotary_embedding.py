@@ -3,6 +3,7 @@ import torch
 from torch import nn
 
 
+#The head dimension (128 in Qwen3) is split into 64 pairs, and each pair gets its own rotation frequency.
 def apply_rotary_emb(
     x: torch.Tensor,
     cos: torch.Tensor,
@@ -26,12 +27,12 @@ class RotaryEmbedding(nn.Module):
         super().__init__()
         self.head_size = head_size
         assert rotary_dim == head_size
-        inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
-        t = torch.arange(max_position_embeddings, dtype=torch.float)
-        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))# shape (rotary_dim // 2,) . base^(-2k/d), k is each pair index 0,1,2,...
+        t = torch.arange(max_position_embeddings, dtype=torch.float) # 0,1,...40960-1. shape  (max_position_embeddings,)
+        freqs = torch.einsum("i,j -> ij", t, inv_freq) # equivalent to  t[:, None] * inv_freq[None, :]. freq[p,d] = p * inv_freq[d]. Row p is all angles at position p. shape (max_position_embeddings, rotary_dim // 2).
         cos = freqs.cos()
         sin = freqs.sin()
-        cache = torch.cat((cos, sin), dim=-1).unsqueeze_(1)
+        cache = torch.cat((cos, sin), dim=-1).unsqueeze_(1) # (40960, 1, 128)
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
     @torch.compile
@@ -41,19 +42,19 @@ class RotaryEmbedding(nn.Module):
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        cos_sin = self.cos_sin_cache[positions]
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        query = apply_rotary_emb(query, cos, sin)
-        key = apply_rotary_emb(key, cos, sin)
+        cos_sin = self.cos_sin_cache[positions] # [num_tokens, 1, 128]
+        cos, sin = cos_sin.chunk(2, dim=-1) # [num_tokens, 1, 64], [num_tokens, 1, 64]
+        query = apply_rotary_emb(query, cos, sin) #  [num_tokens, 16, 128]
+        key = apply_rotary_emb(key, cos, sin) #  [num_tokens, 8, 128]
         return query, key
 
 
 @lru_cache(1)
 def get_rope(
-    head_size: int,
-    rotary_dim: int,
-    max_position: int,
-    base: float,
+    head_size: int, # 128
+    rotary_dim: int, # 128
+    max_position: int,  # 40960
+    base: float, # 10000
 ):
     rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
     return rotary_emb

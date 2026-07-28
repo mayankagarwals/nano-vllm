@@ -18,24 +18,44 @@ class Qwen3Attention(nn.Module):
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
-        max_position: int = 4096 * 32,
+        max_position: int = 4096 * 32,  # 40960
         head_dim: int | None = None,
         rms_norm_eps: float = 1e-06,
         qkv_bias: bool = False,
         rope_theta: float = 10000,
         rope_scaling: dict | None = None,
     ) -> None:
-        super().__init__()
+        '''
+        initialize internal state. stuff 
+        like 
+        self._parameters = {}          # nn.Parameter objects
+        self._modules = {}             # child nn.Module objects
+        self._buffers = {}             # non-parameter tensors
+        self._forward_hooks = {} # hooks like adding to self._modules, self._parameters
+        self._forward_pre_hooks = {}
+        self._backward_hooks = {}
+        self.training = True
+        '''
+        super().__init__() # important. 
         tp_size = dist.get_world_size()
-        self.total_num_heads = num_heads
+        self.total_num_heads = num_heads # 16
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
-        self.total_num_kv_heads = num_kv_heads
+        self.total_num_kv_heads = num_kv_heads # 8
         assert self.total_num_kv_heads % tp_size == 0
         self.num_kv_heads = self.total_num_kv_heads // tp_size
-        self.head_dim = head_dim or hidden_size // self.total_num_heads
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
+        self.head_dim = head_dim or hidden_size // self.total_num_heads # 128 
+        self.q_size = self.num_heads * self.head_dim #4*128
+        self.kv_size = self.num_kv_heads * self.head_dim #3*128
+        '''
+        Why? 
+        each query dot products with all keys. each dot product sums head_dim terms. 
+        Assuming each term has variance near 1, the dot product’s variance grows to roughly head_dim, producing large logits
+        Large logits make softmax extremely peaked:
+        dividing by sqrt(d) keeps logits variance around 1 
+        Why square root of d? 
+        Variance grows by d, but standard deviation grows by root d 
+        '''
         self.scaling = self.head_dim ** -0.5
         self.qkv_bias = qkv_bias
 
@@ -74,17 +94,27 @@ class Qwen3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = q.view(-1, self.num_heads, self.head_dim)
-        k = k.view(-1, self.num_kv_heads, self.head_dim)
-        v = v.view(-1, self.num_kv_heads, self.head_dim)
+        '''
+        Interesting note on how qwen has decoupled hidden_size and head_size. In classic MHA, head_size = hidden_size / num_heads, so q_proj is square. But in qwen3, head_size is fixed at 128, so q_proj is not square.
+        q projection takes [N, hidden_size] to [N, num_heads*head_dim]
+        and then o_proj will take [N, num_heads*head_dim] back to [N, hidden_size]
+        '''
+        qkv = self.qkv_proj(hidden_states) # [num_tokens, (16+8*2)*128] = [num_tokens, 4096]. Done in tp way across all workers by splitting on input dimension 
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)# [num_tokens, (16)*128], [num_tokens, (8)*128], [num_tokens, (8)*128] = [num_tokens, 2048], [num_tokens, 1024], [num_tokens, 1024]
+        q = q.view(-1, self.num_heads, self.head_dim) # [num_tokens, 16, 128]
+        k = k.view(-1, self.num_kv_heads, self.head_dim)# [num_tokens, 8, 128]
+        v = v.view(-1, self.num_kv_heads, self.head_dim)# [num_tokens, 8, 128]
         if not self.qkv_bias:
-            q = self.q_norm(q)
+            q = self.q_norm(q) # No tp in norm 
             k = self.k_norm(k)
-        q, k = self.rotary_emb(positions, q, k)
-        o = self.attn(q, k, v)
-        output = self.o_proj(o.flatten(1, -1))
+        q, k = self.rotary_emb(positions, q, k) # [num_tokens, 16, 128], [num_tokens, 8, 128]. No tensor parallelism here.
+        '''
+        Output shapes: Same as q sent for attention 
+        prefill: o.shape == [num_tokens, num_heads, head_dim]
+        decode: o.shape == [batch_size, 1, num_heads, head_dim]
+        '''
+        o = self.attn(q, k, v) # [num_tokens, 16, 128].
+        output = self.o_proj(o.flatten(1, -1)) # o.flatten(1, -1) collapses every dimension after the first into one, so the per-head attention output becomes a flat vector for o_proj.
         return output
 
 
@@ -97,11 +127,17 @@ class Qwen3MLP(nn.Module):
         hidden_act: str,
     ) -> None:
         super().__init__()
+        '''
+        Parllelize along the intermediate dimension across TP 
+        '''
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
         )
+        '''
+        Parallelize again around intermediate_size
+        '''
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
@@ -111,10 +147,10 @@ class Qwen3MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        gate_up = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x = self.down_proj(x)
-        return x
+        gate_up = self.gate_up_proj(x)# [num_tokens, 2 * intermediate_size / tp_size]
+        x = self.act_fn(gate_up) # [num_tokens, intermediate_size / tp_size]
+        x = self.down_proj(x) # [num_tokens, 1024]
+        return x # [num_tokens, 1024]
 
 
 class Qwen3DecoderLayer(nn.Module):
@@ -125,37 +161,37 @@ class Qwen3DecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.self_attn = Qwen3Attention(
-            hidden_size=config.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            max_position=config.max_position_embeddings,
-            rms_norm_eps=config.rms_norm_eps,
-            qkv_bias=getattr(config, 'attention_bias', True),
-            head_dim=getattr(config, 'head_dim', None),
-            rope_theta=getattr(config, "rope_theta", 1000000),
+            hidden_size=config.hidden_size,# 1024
+            num_heads=config.num_attention_heads, # 16
+            num_kv_heads=config.num_key_value_heads, # 8
+            max_position=config.max_position_embeddings, # 40960
+            rms_norm_eps=config.rms_norm_eps, # 1e-06
+            qkv_bias=getattr(config, 'attention_bias', True), 
+            head_dim=getattr(config, 'head_dim', None), # 128
+            rope_theta=getattr(config, "rope_theta", 1000000), #1000000
             rope_scaling=getattr(config, "rope_scaling", None),
         )
         self.mlp = Qwen3MLP(
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act,
+            hidden_size=config.hidden_size, # 1024
+            intermediate_size=config.intermediate_size, # 3072
+            hidden_act=config.hidden_act, # silu
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor | None,
+        positions: torch.Tensor, # [num_tokens]
+        hidden_states: torch.Tensor, #[num_tokens, hidden_size] 
+        residual: torch.Tensor | None,#[num_tokens, hidden_size]  or None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
-            hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
+            hidden_states, residual = self.input_layernorm(hidden_states), hidden_states # #[num_tokens, hidden_size], #[num_tokens, hidden_size].
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(positions, hidden_states)
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.self_attn(positions, hidden_states) # [num_tokens, 1024]
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)# [num_tokens, 1024]
+        hidden_states = self.mlp(hidden_states)# [num_tokens, 1024]
         return hidden_states, residual
 
 
@@ -166,20 +202,20 @@ class Qwen3Model(nn.Module):
         config: Qwen3Config,
     ) -> None:
         super().__init__()
-        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
+        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size) # [Din, Dout]
         self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor, # [num_tokens]
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
+        hidden_states = self.embed_tokens(input_ids) # [num_tokens, hidden_dimension]. Using all workers to do embedding lookup along vocab dimension 
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, residual)
-        hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states, _ = self.norm(hidden_states, residual) # no tp
         return hidden_states
 
 
@@ -199,7 +235,7 @@ class Qwen3ForCausalLM(nn.Module):
         super().__init__()
         self.model = Qwen3Model(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
-        if config.tie_word_embeddings:
+        if config.tie_word_embeddings: # true
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
 
     def forward(
@@ -211,6 +247,6 @@ class Qwen3ForCausalLM(nn.Module):
 
     def compute_logits(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor, # [num_tokens, hidden_dim]
     ) -> torch.Tensor:
         return self.lm_head(hidden_states)
