@@ -173,9 +173,14 @@ class ModelRunner:
           positions    = [4, 5, 6, 7,           4, 5,     0,  1,  2]     # where in seq; this is what increases/resets
           cu_seqlens_q = [0, 4, 6, 9]                                       # 4 + 2 + 3 tokens computed
           cu_seqlens_k = [0, 8, 14, 17]                                     # 8 + 6 + 3 total KV length (includes cached)
+
+
+
           slot_mapping = [28,29,30,31,  36,37,  8,9,10]                     # each seq's tokens fit in one logical block here
                        # seq0 phys block 7 -> 28-31, seq1 phys block 9 -> 36-37, seq2 phys block 2 -> 8-10
                        # gaps (31->36, 37->8) are normal: different seqs use different physical blocks
+        Slot mapping is useful to just store the keys and values we will generate at the right place in the kv cache. 
+
           block_tables = [[3, 7], [5, 9], [2, -1]]                      # needed: k_len (17) > q_len (9); seq2 padded to max len 2
 
           # if uncached tokens span a block boundary, slots jump mid-sequence too:

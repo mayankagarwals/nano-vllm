@@ -27,7 +27,8 @@ class BlockManager:
 
     def __init__(self, num_blocks: int, block_size: int):
         self.block_size = block_size
-        self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
+        # all are physical block id 
+        self.blocks: list[Block] = [Block(i) for i in range(num_blocks)] 
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
@@ -145,8 +146,8 @@ class BlockManager:
 
         # doing till end-1 as end is the count of fully completed blocks 
         for i in range(start, end):
-            block = self.blocks[seq.block_table[i]]
+            block = self.blocks[seq.block_table[i]] # get the physical block 
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
-            block.update(h, token_ids)
-            self.hash_to_block_id[h] = block.block_id
+            block.update(h, token_ids) # update hash
+            self.hash_to_block_id[h] = block.block_id # update hash to block id mapping
